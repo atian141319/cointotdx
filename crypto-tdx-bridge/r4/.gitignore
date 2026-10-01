@@ -13,3 +13,4 @@ DELIVERY.json
 *.spec
 *.zip
 *.sha256
+acceptance-*/

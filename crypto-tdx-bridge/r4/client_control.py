@@ -86,31 +86,37 @@ class Client:
         return {'requested':'guest login','error':'No identified public guest button'}
 
     def period(self, period):
-        # Coordinates follow the already observed V7.73 chart toolbar, not private commands.
+        # Click the visible chart's observed toolbar in its own client coordinates.
+        # Root ClientToScreen/ScreenToClient conversions can select the wrong period at 125% DPI.
         positions={'1m':76,'5m':116,'15m':162,'30m':207,'1h':251,'1d':291}
         windows=[w for w in self.windows() if '分析图表' in w[1]]
         if not windows or period not in positions:
             raise RuntimeError('No observed analysis chart or unsupported toolbar period')
-        handle=windows[0][0]
-        self.user.ChildWindowFromPointEx.argtypes=[W.HWND,W.POINT,W.UINT]
-        self.user.ChildWindowFromPointEx.restype=W.HWND
-        self.user.ClientToScreen.argtypes=[W.HWND,C.POINTER(W.POINT)]
-        self.user.ScreenToClient.argtypes=[W.HWND,C.POINTER(W.POINT)]
-        point=W.POINT(positions[period],38)
-        self.user.ClientToScreen(W.HWND(handle),C.byref(point))
-        for _ in range(12):
-            local=W.POINT(point.x,point.y)
-            self.user.ScreenToClient(W.HWND(handle),C.byref(local))
-            child=self.user.ChildWindowFromPointEx(W.HWND(handle),local,3)
-            if not child or int(child)==handle:break
-            handle=int(child)
-        local=W.POINT(point.x,point.y)
-        self.user.ScreenToClient(W.HWND(handle),C.byref(local))
-        packed=(local.y<<16)|(local.x&65535)
+        root=windows[0][0]
+        chart=next((item['handle'] for item in self.children(root) if item['name'].startswith('分析图表')),None)
+        if not chart:
+            raise RuntimeError('Visible MDI analysis chart missing')
+        class Rect(C.Structure):
+            _fields_=[('left',W.LONG),('top',W.LONG),('right',W.LONG),('bottom',W.LONG)]
+        root_rect=Rect();self.user.GetWindowRect(W.HWND(root),C.byref(root_rect))
+        candidates=[]
+        for item in self.children(chart):
+            if item['id']==213 and item['class']=='CFQS_SwitchEx' and self.user.IsWindowVisible(W.HWND(item['handle'])):
+                rect=Rect();self.user.GetWindowRect(W.HWND(item['handle']),C.byref(rect))
+                if rect.right>rect.left and rect.bottom>rect.top:
+                    candidates.append((item['handle'],rect))
+        if len(candidates)!=1:
+            raise RuntimeError('Observed chart toolbar is not unique')
+        handle,rect=candidates[0]
+        x=positions[period]-(rect.left-root_rect.left)
+        y=(rect.bottom-rect.top)//2
+        if not 0<=x<rect.right-rect.left:
+            raise RuntimeError('Observed toolbar layout changed')
+        packed=(y<<16)|(x&65535)
         self.user.PostMessageW(W.HWND(handle),0x201,1,packed)
         self.user.PostMessageW(W.HWND(handle),0x202,0,packed)
         return {'operation':'standard chart-toolbar click','period_requested':period,
-                'handle':handle,'cache_reload_verified':False}
+                'handle':handle,'client_point':[x,y],'cache_reload_verified':False}
 
     def capture(self, path):
         windows = self.windows()

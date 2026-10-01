@@ -21,7 +21,14 @@ class Desktop:
     def __init__(self, root, config_path=None):
         self.root = root
         self.path = Path(config_path or app_home() / 'settings.json')
-        self.config = load(self.path) if self.path.exists() else default_settings()
+        # A moved/missing client must not prevent opening the window that repairs its paths.
+        # Only startup editing defers path checks; gather/save/start retain strict validation.
+        self.config = load(self.path, check_paths=False) if self.path.exists() else default_settings()
+        self.startup_path_error = None
+        try:
+            validate(self.config)
+        except ValueError as error:
+            self.startup_path_error = str(error)
         self.engine = None
         self.reload_requested = False
         self.messages = queue.Queue()
@@ -49,6 +56,12 @@ class Desktop:
         ttk.Button(terminal, text='恢复管理文件', command=self.restore).grid(row=4, column=2)
         ttk.Label(terminal, text='仅管理已注册的397xxx外部品种。首次写入先备份；联调请选择隔离副本。\n'
             '实时精确库与显示文件分开。停用、删除币种默认保留历史。', wraplength=780).grid(row=5, column=0, columnspan=3, sticky='w', pady=12)
+        if self.startup_path_error:
+            warning = ('路径配置需要修正：' + self.startup_path_error + '\n当前启动程序：' +
+                       self.config['tdx']['executable'] + '\n请选择正确的隔离通达信目录，再检查并保存配置。同步尚未启动。')
+            ttk.Label(terminal, text=warning, foreground='#b00020', wraplength=800).grid(
+                row=6, column=0, columnspan=3, sticky='w', pady=8)
+            self.inform(warning)
         self.tree = ttk.Treeview(pairs, columns=('symbol', 'name', 'code', 'market', 'enabled', 'start'), show='headings', height=13)
         for key, heading, width in (('symbol','交易对',130), ('name','显示名称',150), ('code','通达信代码',100),
                                     ('market','市场',60), ('enabled','启用',60), ('start','UTC历史起点',290)):

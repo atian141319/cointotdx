@@ -29,7 +29,7 @@ def default_settings():
                  hour=0, minute=0, second=0, microsecond=0).isoformat()}]}
 
 
-def validate(value):
+def validate(value, *, check_paths=True):
     c = copy.deepcopy(value)
     if c.get('schema') != 1 or c['endpoint'] not in ENDPOINTS:
         raise ValueError('Unsupported schema or non-official WebSocket endpoint')
@@ -65,7 +65,7 @@ def validate(value):
         symbols.add(pair['symbol'])
     if sum(pair['enabled'] for pair in c['pairs']) * len(INTERVALS) > 1024:
         raise ValueError('More than 1024 streams')
-    if c['tdx']['installation']:
+    if check_paths and c['tdx']['installation']:
         root = Path(c['tdx']['installation']).resolve()
         executable = Path(c['tdx']['executable']).resolve()
         data = Path(c['tdx']['data_directory']).resolve()
@@ -92,8 +92,8 @@ def save(path, value):
     return c
 
 
-def load(path):
-    return validate(json.loads(Path(path).read_text(encoding='utf-8-sig')))
+def load(path, *, check_paths=True):
+    return validate(json.loads(Path(path).read_text(encoding='utf-8-sig')), check_paths=check_paths)
 
 
 def registration_check(c, pair, managed=None):
