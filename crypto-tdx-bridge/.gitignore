@@ -1,0 +1,8 @@
+__pycache__/
+data/
+output-audit/
+config.json
+review-package.zip
+review-package.sha256
+evidence/market-snapshot.sqlite3
+artifacts/

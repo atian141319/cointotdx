@@ -1,0 +1,15 @@
+.venv/
+.build-venv/
+__pycache__/
+build/
+release/
+live-data/
+data/
+evidence/
+offline-fresh*/
+live-settings.json
+settings.json
+DELIVERY.json
+*.spec
+*.zip
+*.sha256

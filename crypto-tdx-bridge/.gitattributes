@@ -1,0 +1,2 @@
+# Preserve the exact bytes of signed source and Windows scripts.
+* -text

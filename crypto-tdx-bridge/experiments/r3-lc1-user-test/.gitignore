@@ -1,0 +1,4 @@
+client/
+backup/
+transactions/
+__pycache__/
