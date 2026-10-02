@@ -11,6 +11,36 @@ import uuid
 ENDPOINTS = ('wss://stream.binance.com:443', 'wss://stream.binance.com:9443',
              'wss://data-stream.binance.vision')
 INTERVALS = ('1m', '5m', '15m', '30m', '1h', '1d', '1w', '1M')
+DISPLAY_PROFILE = 'market10-continuous-utc-lastminute-v1'
+
+
+def adapted_pair(pair):
+    """Build the verified trial strategy from user-facing fields, without offsets."""
+    result = copy.deepcopy(pair)
+    start = datetime.fromisoformat(result['history_start'].replace('Z', '+00:00'))
+    if start.tzinfo is None:
+        raise ValueError('History start requires explicit timezone')
+    start = start.astimezone(timezone.utc)
+    context = start.replace(hour=23, minute=0, second=0, microsecond=0)
+    if context >= start:
+        context -= timedelta(days=1)
+    result.update(market='ds', market_id=10, lc5_time_label='last_minute',
+                  display_profile=DISPLAY_PROFILE,
+                  history_start=start.isoformat(), display_context_start=context.isoformat())
+    return result
+
+
+def available_code(config):
+    used = {p['code'] for p in config['pairs']}
+    root = Path(config['tdx']['installation'])
+    registry_paths = [root / 'T0002/hq_cache/ds_stk.dat', root / 'T0002/lc/lcext.lei']
+    registry_paths += [root / 'T0002/hq_cache' / f'{market}s.tnf' for market in ('sh', 'sz', 'bj')]
+    registries = [p.read_bytes() for p in registry_paths if p.is_file()]
+    for number in range(397903, 398000):
+        code = str(number)
+        if code not in used and not any(code.encode('ascii') in data for data in registries):
+            return code
+    raise ValueError('No conflict-free managed display code available')
 
 
 def app_home():
@@ -23,10 +53,10 @@ def default_settings():
         'connection_timeout': 12, 'proxy': '', 'rest_endpoint': 'https://data-api.binance.vision',
         'rest_timeout': 15, 'rest_retries': 2, 'publish_seconds': 3,
         'rotation_seconds': 86100, 'refresh': 'none', 'pairs': [
-            {'symbol': 'BTCUSDT', 'display_name': 'BTCUSDT', 'code': '397901',
-             'market': 'sz', 'enabled': True,
+            adapted_pair({'symbol': 'BTCUSDT', 'display_name': 'BTCUSDT试验', 'code': '397901',
+             'market': 'ds', 'market_id': 10, 'enabled': True,
              'history_start': (datetime.now(timezone.utc) - timedelta(days=1)).replace(
-                 hour=0, minute=0, second=0, microsecond=0).isoformat()}]}
+                 hour=0, minute=0, second=0, microsecond=0).isoformat()})]}
 
 
 def validate(value, *, check_paths=True):
@@ -42,15 +72,17 @@ def validate(value, *, check_paths=True):
         raise ValueError('Invalid retry/rotation setting')
     if c.get('proxy') and not re.fullmatch(r'(http|socks5)://[^\s]+', c['proxy']):
         raise ValueError('Proxy must be http://host:port or socks5://host:port')
-    if c.get('refresh', 'none') != 'none':
+    if c.get('refresh', 'none') not in ('none','observed_toolbar'):
         raise ValueError('Unknown refresh mode')
     seen = set()
     symbols = set()
     for pair in c['pairs']:
         if not re.fullmatch('[A-Z0-9]{5,30}', pair['symbol']):
             raise ValueError('Invalid symbol')
-        if not re.fullmatch('397[0-9]{3}', pair['code']) or pair['market'] != 'sz':
-            raise ValueError('Only proven SZ external 397xxx registration is enabled')
+        if not re.fullmatch('397[0-9]{3}', pair['code']) or pair['market'] not in ('sz', 'ds'):
+            raise ValueError('Only managed external 397xxx codes are enabled')
+        if pair['market'] == 'ds' and pair.get('market_id') != 10:
+            raise ValueError('Only observed basic-FX market 10 is enabled for this display trial')
         if pair['symbol'] == 'BTCUSDT' and pair['code'] != '397901':
             raise ValueError('BTCUSDT must retain 397901')
         if type(pair['enabled']) is not bool or not pair['display_name'].strip():
@@ -58,6 +90,22 @@ def validate(value, *, check_paths=True):
         stamp = datetime.fromisoformat(pair['history_start'].replace('Z', '+00:00'))
         if stamp.tzinfo is None:
             raise ValueError('History start requires explicit timezone')
+        label = pair.get('lc5_time_label', 'open')
+        if pair.get('display_profile') not in (None, DISPLAY_PROFILE):
+            raise ValueError('Unknown display adaptation profile')
+        if pair.get('display_profile') == DISPLAY_PROFILE and label != 'last_minute':
+            raise ValueError('Verified profile requires last-minute labels')
+        if label not in ('open', 'last_minute'):
+            raise ValueError('Unknown LC5 time label')
+        if label == 'last_minute':
+            if pair['market'] != 'ds' or pair.get('market_id') != 10:
+                raise ValueError('Last-minute adaptation is verified only for isolated market 10')
+            context = datetime.fromisoformat(pair.get('display_context_start','').replace('Z','+00:00'))
+            if context.tzinfo is None:
+                raise ValueError('Display context start requires UTC timezone')
+            context = context.astimezone(timezone.utc)
+            if context.hour != 23 or context.minute or context.second or context.microsecond or context >= stamp:
+                raise ValueError('Verified display prefix starts at a preceding UTC 23:00 full-hour boundary')
         identity = (pair['market'], pair['code'])
         if identity in seen or pair['symbol'] in symbols:
             raise ValueError('Duplicate symbol or market/code combination')
@@ -99,6 +147,12 @@ def load(path, *, check_paths=True):
 def registration_check(c, pair, managed=None):
     """Read the actual external registry, never treat a searched TNF name as ownership."""
     root = Path(c['tdx']['installation'])
+    if pair['market'] == 'ds':
+        from external_registry import check, identity
+        key = identity(pair)
+        if managed and key in managed and managed[key]['symbol'] != pair['symbol']:
+            return False, 'Code already managed for a different symbol'
+        return check(root, pair)
     for market in ('sh', 'sz', 'bj'):
         tnf = root / 'T0002/hq_cache' / f'{market}s.tnf'
         if tnf.is_file():

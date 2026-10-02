@@ -28,6 +28,8 @@ class Engine(threading.Thread):
         self.receiver = None
         self.backfill_requested = threading.Event()
         self.rest_blocked = False
+        from history_guard import HistoryGuard
+        self.history_guard = HistoryGuard()
 
     def status(self, **changes):
         with self.status_lock:
@@ -53,6 +55,13 @@ class Engine(threading.Thread):
         directory.mkdir(parents=True, exist_ok=True)
         (directory / 'STOP').touch()
 
+    def follow_latest(self):
+        from client_control import Client
+        operation = Client(self.config).follow_latest(self.config['pairs'])
+        self.history_guard.navigation('latest')
+        self.status(follow_latest_request=operation, follow_latest_request_ms=int(time.time()*1000))
+        return operation
+
     def rest_config(self):
         return {'base_url': self.config['rest_endpoint'], 'pairs': self.config['pairs'],
             'data_dir': self.config['data_directory'], 'timeout_seconds': self.config['rest_timeout'],
@@ -75,7 +84,8 @@ class Engine(threading.Thread):
                 with live.db:
                     live.db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?,?)', (pair['symbol'], json.dumps(item), raw))
                 for interval in INTERVALS:
-                    start = bridge.floor(bridge.ms(pair['history_start']), interval)
+                    history_start = pair['display_context_start'] if interval in ('1m','5m') and pair.get('lc5_time_label') == 'last_minute' else pair['history_start']
+                    start = bridge.floor(bridge.ms(history_start), interval)
                     if interval == '1d':
                         start = bridge.floor(start, '1M')  # Daily basis covers the first requested calendar month.
                     end = bridge.floor(now, interval)  # REST never overwrites buffered current bar.
@@ -105,7 +115,8 @@ class Engine(threading.Thread):
             for interval in ('1m', '5m', '1d'):
                 rows = [json.loads(payload) for (payload,) in live.db.execute(
                     'SELECT payload FROM bars WHERE symbol=? AND interval=? AND open_ms>=? ORDER BY open_ms',
-                    (pair['symbol'], interval, bridge.floor(bridge.ms(pair['history_start']), '1M' if interval == '1d' else interval)))]
+                    (pair['symbol'], interval, bridge.floor(bridge.ms(pair['display_context_start']
+                        if interval in ('1m','5m') and pair.get('lc5_time_label') == 'last_minute' else pair['history_start']), '1M' if interval == '1d' else interval)))]
                 if rows:
                     publisher.queue(pair, interval, rows)
 
@@ -186,6 +197,15 @@ class Engine(threading.Thread):
                         last_flush = time.monotonic()
                         if publisher.flush():
                             self.status(refresh='Files published; chart observation is recorded separately')
+                            if self.config.get('refresh') == 'observed_toolbar':
+                                try:
+                                    from client_control import Client
+                                    from chart_refresh import reload_active
+                                    request=reload_active(Client(self.config),self.config['pairs'],self.history_guard)
+                                    self.status(refresh_request=request,refresh_request_ms=int(time.time()*1000),refresh_error=None,
+                                                history_view=self.history_guard.snapshot())
+                                except Exception as error:
+                                    self.status(refresh_error=str(error))
                     self.status(history='live' if connected_once else 'waiting for stream acknowledgement')
                 # Preserve the final coalesced update when the user requests a clean stop.
                 publisher.flush()
@@ -193,6 +213,7 @@ class Engine(threading.Thread):
             self.status(error=str(error))
             self.log('Fatal engine error: ' + str(error))
         finally:
+            self.history_guard.close()
             if self.receiver:
                 self.receiver.stop()
                 self.receiver.join(timeout=self.config['connection_timeout'] + 5)

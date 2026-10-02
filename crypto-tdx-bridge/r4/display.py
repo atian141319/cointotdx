@@ -12,27 +12,37 @@ import time
 import uuid
 
 from settings import registration_check
+from external_registry import identity
 
 MINUTE = struct.Struct('<HHfffffII')
 DAY = struct.Struct('<IIIIIfII')
+EXTERNAL_DAY = struct.Struct('<IfffffII')
 
 
-def stamp(row):
-    moment = datetime.fromtimestamp(row[0] / 1000, timezone.utc)
+def stamp(row, interval='1m', minute_label='open'):
+    if minute_label not in ('open', 'last_minute'):
+        raise ValueError('Unknown minute time label')
+    if minute_label == 'last_minute' and interval != '5m':
+        raise ValueError('Last-minute adaptation is only verified for LC5')
+    if interval == '5m' and row[0] % 300000:
+        raise ValueError('Source five-minute open time is not UTC aligned')
+    # Always derive from the precise source open, never from a previously encoded label.
+    labelled_ms = row[0] + (240000 if minute_label == 'last_minute' else 0)
+    moment = datetime.fromtimestamp(labelled_ms / 1000, timezone.utc)
     day = (moment.year - 2004) * 2048 + moment.month * 100 + moment.day
     if not 0 <= day <= 65535 or row[0] % 60000:
         raise ValueError('Minute date exceeds candidate representation')
     return day, moment.hour * 60 + moment.minute
 
 
-def encode(row, daily=False):
+def encode(row, daily=False, external=False, *, interval='1m', minute_label='open'):
     values = []
     differences = {}
     for name, index in (('open', 1), ('high', 2), ('low', 3), ('close', 4), ('amount_usdt', 7)):
         exact = Decimal(row[index])
         if not exact.is_finite() or exact < 0:
             raise ValueError('Non-finite/negative exact value')
-        if daily and index != 7:
+        if daily and not external and index != 7:
             integer = int((exact * 1000).to_integral_value(rounding=ROUND_HALF_EVEN))
             if not 0 <= integer <= 0xffffffff:
                 raise ValueError('DAY price overflow; no alternative scaling')
@@ -55,13 +65,13 @@ def encode(row, daily=False):
         'positive_became_zero': quantity > 0 and integer == 0}
     if daily:
         date = int(datetime.fromtimestamp(row[0] / 1000, timezone.utc).strftime('%Y%m%d'))
-        binary = DAY.pack(date, *values, integer, 0)
+        binary = (EXTERNAL_DAY if external else DAY).pack(date, *values, integer, 0)
     else:
-        binary = MINUTE.pack(*stamp(row), *values, integer, 0)
+        binary = MINUTE.pack(*stamp(row, interval, minute_label), *values, integer, 0)
     return binary, differences
 
 
-def decode_time(raw, daily):
+def decode_time(raw, daily, *, interval='1m', minute_label='open'):
     if daily:
         date = struct.unpack_from('<I', raw)[0]
         return int(datetime.strptime(str(date), '%Y%m%d').replace(tzinfo=timezone.utc).timestamp() * 1000)
@@ -69,8 +79,16 @@ def decode_time(raw, daily):
     year, monthday = day // 2048 + 2004, day % 2048
     if not 0 <= minute < 1440:
         raise ValueError('Existing cache has invalid minute')
-    return int(datetime(year, monthday // 100, monthday % 100, minute // 60,
+    labelled = int(datetime(year, monthday // 100, monthday % 100, minute // 60,
                         minute % 60, tzinfo=timezone.utc).timestamp() * 1000)
+    if interval == '5m':
+        expected_phase = 240000 if minute_label == 'last_minute' else 0
+        if labelled % 300000 != expected_phase:
+            raise ValueError('Existing LC5 time-label phase differs; explicit rebuild required')
+        return labelled - expected_phase
+    if minute_label != 'open':
+        raise ValueError('LC1 retains source opening-minute labels')
+    return labelled
 
 
 class Publisher:
@@ -110,6 +128,11 @@ class Publisher:
 
     def targets(self, pair):
         market, code = pair['market'], pair['code']
+        if market == 'ds':
+            prefix = f"{pair['market_id']}#{code}"
+            return {'1m': self.root / 'ds/minline' / (prefix + '.lc1'),
+                    '5m': self.root / 'ds/fzline' / (prefix + '.lc5'),
+                    '1d': self.root / 'ds/lday' / (prefix + '.day')}
         return {'1m': self.root / market / 'minline' / f'{market}{code}.lc1',
                 '5m': self.root / market / 'fzline' / f'{market}{code}.lc5',
                 '1d': self.root / market / 'lday' / f'{market}{code}.day'}
@@ -118,7 +141,13 @@ class Publisher:
         allowed, reason = registration_check(self.config, pair, self.managed)
         if not allowed:
             raise ValueError(reason)
-        key = pair['market'] + ':' + pair['code']
+        key = identity(pair)
+        label = pair.get('lc5_time_label', 'open')
+        if label == 'last_minute':
+            from session_config import locate, CONTINUOUS_05
+            _, actual = locate((Path(self.config['tdx']['installation']) / 'T0002/hq_cache/ds_tinf.dat').read_bytes())
+            if actual != CONTINUOUS_05:
+                raise ValueError('Continuous-session trial profile is not installed; display blocked')
         if key not in self.managed:
             files = []
             for interval, path in self.targets(pair).items():
@@ -134,10 +163,13 @@ class Publisher:
                     backup.write_bytes(raw)
                     entry['sha256'] = hashlib.sha256(raw).hexdigest()
                 files.append(entry)
-            self.managed[key] = {'symbol': pair['symbol'], 'data_directory': str(self.root), 'files': files}
+            self.managed[key] = {'symbol': pair['symbol'], 'data_directory': str(self.root),
+                                 'lc5_time_label': label, 'files': files}
             self._json_atomic(self.managed_path, self.managed)
         elif self.managed[key]['data_directory'] != str(self.root):
             raise ValueError('Data directory changed; use separate local data directory to preserve ownership')
+        elif self.managed[key].get('lc5_time_label', 'open') != label:
+            raise ValueError('Managed LC5 label changed; explicit backed-up migration required')
 
     @staticmethod
     def _json_atomic(path, value):
@@ -150,15 +182,20 @@ class Publisher:
             return
         self.claim(pair)
         path = self.targets(pair)[interval]
+        label = pair.get('lc5_time_label', 'open') if interval == '5m' else 'open'
         if path not in self.cache:
             raw = path.read_bytes() if path.exists() else b''
             if len(raw) % 32:
                 raise ValueError('Existing cache is truncated')
-            self.cache[path] = {decode_time(raw[i:i + 32], interval == '1d'): raw[i:i + 32]
+            self.cache[path] = {decode_time(raw[i:i + 32], interval == '1d', interval=interval,
+                                          minute_label=label): raw[i:i + 32]
                                 for i in range(0, len(raw), 32)}
+            if len(self.cache[path]) != len(raw) // 32:
+                raise ValueError('Duplicate source times in existing display file')
         dirty = self.pending.setdefault(path, {})
         for row in rows:
-            raw, error = encode(row, interval == '1d')
+            raw, error = encode(row, interval == '1d', pair['market'] == 'ds',
+                                interval=interval, minute_label=label)
             if self.cache[path].get(row[0]) != raw or row[0] in dirty:
                 dirty[row[0]] = (raw, error)
 
@@ -196,6 +233,9 @@ class Publisher:
                     'rollback_file': rollback_file, 'old_exists': old is not None,
                     'old_sha256': hashlib.sha256(old or b'').hexdigest(),
                     'records': len(combined), 'sha256': hashlib.sha256(new).hexdigest(),
+                    'time_label': 'source UTC open + 4 minutes (last minute)' if path.suffix == '.lc5'
+                        and next(p for p in self.config['pairs'] if self.targets(p).get('5m') == path).get('lc5_time_label','open') == 'last_minute'
+                        else 'source UTC open',
                     'errors': [{'open_ms': opened, 'fields': values[1]} for opened, values in updates.items()]})
                 staged.append((path, temporary, old, combined, new))
             self._json_atomic(transaction / 'receipt.json', {'batch_id': identity, 'state': 'PREPARED', 'files': changes})
@@ -222,7 +262,7 @@ class Publisher:
                 self.cache[path] = combined
                 self.pending[path].clear()
             self._json_atomic(transaction / 'receipt.json', {'batch_id': identity, 'state': 'COMMITTED',
-                'display_trial_only': True, 'utc_label': 'open minute', 'files': changes})
+                'display_trial_only': True, 'utc_label': 'per-file explicit source-derived label', 'files': changes})
             self.status(last_file_ms=int(time.time() * 1000), file_error=None,
                         batch_id=identity, files=[{k: item[k] for k in ('path', 'records', 'sha256')} for item in changes])
             return True

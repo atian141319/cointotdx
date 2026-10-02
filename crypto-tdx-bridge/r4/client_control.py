@@ -62,6 +62,28 @@ class Client:
         return {'operation': 'public RedrawWindow', 'windows': windows,
                 'cache_reload_verified': False}
 
+    def follow_latest(self, pairs):
+        windows = [w for w in self.windows() if 'V7.73' in w[1]]
+        if len(windows) != 1:
+            raise RuntimeError('No unique selected client')
+        main, title, _ = windows[0]
+        if not any(p['enabled'] and title.endswith('[分析图表-' + p['display_name'] + ']') for p in pairs):
+            raise RuntimeError('Active chart is not a configured owned instrument')
+        from chart_refresh import observed_period
+        from history_guard import fixed_cursor_visible
+        capture = self.capture(None)
+        observed_period(capture['bitmap'])
+        view = next((i['handle'] for i in self.children(main) if i['class'].endswith(':300b')), None)
+        if not view:
+            raise RuntimeError('Observed chart view absent')
+        self.user.SendMessageW(W.HWND(view), 0x100, 0x23, 0)
+        self.user.SendMessageW(W.HWND(view), 0x101, 0x23, 0)
+        if fixed_cursor_visible(self.capture(None)['bitmap']):
+            self.user.SendMessageW(W.HWND(view), 0x100, 0x1B, 0)
+            self.user.SendMessageW(W.HWND(view), 0x101, 0x1B, 0)
+        return {'requested': 'return to latest using public End and optional Escape',
+                'chart_update_verified': False}
+
     def children(self, root):
         items=[]
         callback_type=C.WINFUNCTYPE(W.BOOL,W.HWND,W.LPARAM)
@@ -88,7 +110,7 @@ class Client:
     def period(self, period):
         # Click the visible chart's observed toolbar in its own client coordinates.
         # Root ClientToScreen/ScreenToClient conversions can select the wrong period at 125% DPI.
-        positions={'1m':76,'5m':116,'15m':162,'30m':207,'1h':251,'1d':291}
+        positions={'1m':76,'5m':116,'15m':162,'30m':207,'1h':251,'1d':291,'1w':333,'1M':376}
         windows=[w for w in self.windows() if '分析图表' in w[1]]
         if not windows or period not in positions:
             raise RuntimeError('No observed analysis chart or unsupported toolbar period')
@@ -156,9 +178,12 @@ class Client:
             info = C.create_string_buffer(header)
             if not gdi.GetDIBits(memory, bitmap, 0, height, data, info, 0):
                 raise RuntimeError('Capture readback failed')
+            bitmap_bytes = struct.pack('<2sIHHI', b'BM', 54 + len(data), 0, 0, 54) + header + data.raw
+            if path is None:
+                return {'bitmap':bitmap_bytes,'title':title,'pid':pid,'handle':handle}
             path = Path(path)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(struct.pack('<2sIHHI', b'BM', 54 + len(data), 0, 0, 54) + header + data.raw)
+            path.write_bytes(bitmap_bytes)
             evidence = {'actual_executable': str(self.executable), 'pid': pid, 'title': title,
                         'observed_ms': int(time.time() * 1000), 'capture': path.name}
             path.with_suffix('.json').write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding='utf-8')

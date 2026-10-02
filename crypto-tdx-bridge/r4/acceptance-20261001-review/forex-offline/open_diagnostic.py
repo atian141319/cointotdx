@@ -40,7 +40,7 @@ try:
         _fields_ = [("kind", W.DWORD), ("payload", Payload)]
     u.SendInput.argtypes = [W.UINT, C.POINTER(Input), C.c_int]
     code = sys.argv[1] if len(sys.argv) > 1 else "R4BTC1"
-    if code not in ("R4BTC1", "R4BTC2", "397901", "EURUSD"):
+    if code not in ("R4BTC1", "R4BTC2", "397901", "397903", "397904", "397905", "397913", "EURUSD"):
         raise ValueError("Only explicitly prepared diagnostic/control identities")
     for character in code:
         for flags in (4, 6):

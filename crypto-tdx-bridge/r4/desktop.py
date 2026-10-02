@@ -13,7 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 from client_control import Client
 from display import Publisher
 from engine import Engine
-from settings import ENDPOINTS, app_home, default_settings, load, registration_check, save, validate
+from settings import ENDPOINTS, app_home, adapted_pair, available_code, default_settings, load, registration_check, save, validate
 from streams import probe
 
 
@@ -54,6 +54,7 @@ class Desktop:
         ttk.Button(terminal, text='检查配置', command=self.check).grid(row=4, column=0, pady=10)
         ttk.Button(terminal, text='启动通达信', command=self.start_client).grid(row=4, column=1, sticky='w')
         ttk.Button(terminal, text='恢复管理文件', command=self.restore).grid(row=4, column=2)
+        ttk.Button(terminal, text='返回最新并恢复自动重读', command=self.follow_latest).grid(row=4, column=3,padx=6)
         ttk.Label(terminal, text='仅管理已注册的397xxx外部品种。首次写入先备份；联调请选择隔离副本。\n'
             '实时精确库与显示文件分开。停用、删除币种默认保留历史。', wraplength=780).grid(row=5, column=0, columnspan=3, sticky='w', pady=12)
         if self.startup_path_error:
@@ -68,6 +69,8 @@ class Desktop:
             self.tree.heading(key, text=heading)
             self.tree.column(key, width=width)
         self.tree.pack(fill='both', expand=True)
+        ttk.Label(pairs, text='时间均为UTC：精确库保存开盘时间；LC1显示开盘分钟；启用末分钟适配的LC5显示开盘＋4分钟。\n'
+            '15/30/60分钟显示窗口最后一分钟；真实前补历史用于首端初始化，量价仍为有损显示试验。').pack(anchor='w')
         buttons = ttk.Frame(pairs)
         buttons.pack(fill='x', pady=8)
         for text, action in [('添加',lambda: self.edit_pair()), ('编辑',lambda: self.edit_pair(True)),
@@ -84,6 +87,9 @@ class Desktop:
         self.field(connection, 'rest_retries', 'REST有限重试次数', self.config['rest_retries'], 5)
         self.field(connection, 'publish_seconds', '文件合并写入间隔（秒）', self.config['publish_seconds'], 6)
         ttk.Button(connection, text='真实连接测试', command=self.test_connection).grid(row=7,column=1,sticky='w',pady=12)
+        self.auto_reload=tk.BooleanVar(value=self.config.get('refresh')=='observed_toolbar')
+        ttk.Checkbutton(connection,text='自动重读当前分钟图（点击当前周期，不切换周期；仅支持已验证窗口布局）',
+            variable=self.auto_reload).grid(row=9,column=0,columnspan=3,sticky='w',pady=8)
         ttk.Label(connection,text='代理支持http://host:port / socks5://host:port，仅用于WebSocket；REST沿用直连。\n'
             '1m与1M不同；60分钟订阅1h。无交易API密钥。',wraplength=780).grid(row=8,column=0,columnspan=3,sticky='w')
         self.status_text = tk.Text(status, height=15, wrap='word', state='disabled')
@@ -98,7 +104,7 @@ class Desktop:
         for text, action in [('保存配置',self.save),('导入配置',self.import_config),('导出配置',self.export_config),
             ('开始同步',self.start),('停止同步',self.stop),('补历史',self.backfill)]:
             ttk.Button(footer,text=text,command=action).pack(side='left',padx=4)
-        ttk.Label(root,text='显示试验：float32价格/金额、整数截断基础币量；日线价格3位表示。误差逐条保存，不是准确行情认证。',
+        ttk.Label(root,text='显示试验：float32价格/金额、整数截断基础币量；外部日线float32，深圳日线价格3位。误差逐条保存，不是准确行情认证。',
             foreground='#9c4200').pack(anchor='w',padx=12,pady=(0,8))
         self.refresh_pairs()
         root.protocol('WM_DELETE_WINDOW',self.close)
@@ -122,6 +128,7 @@ class Desktop:
         for key in ('connection_timeout','rest_timeout','publish_seconds'):
             c[key]=float(self.vars[key].get())
         c['rest_retries']=int(self.vars['rest_retries'].get())
+        c['refresh']='observed_toolbar' if self.auto_reload.get() else 'none'
         return validate(c)
 
     def inform(self,text):
@@ -168,6 +175,7 @@ class Desktop:
             self.engine=Engine(copy.deepcopy(self.config));self.engine.start()
 
     def apply_fields(self):
+        self.auto_reload.set(self.config.get('refresh')=='observed_toolbar')
         for key,var in [('installation','installation'),('executable','executable'),('data_directory','tdx_data')]:
             self.vars[var].set(self.config['tdx'][key])
         for key,var in [('data_directory','exact_data'),('endpoint','endpoint'),('proxy','proxy'),
@@ -219,17 +227,36 @@ class Desktop:
     def edit_pair(self,edit=False):
         try:index=self.selected() if edit else None
         except Exception as error:self.inform(str(error));return
-        pair=copy.deepcopy(self.config['pairs'][index]) if index is not None else {'symbol':'','display_name':'','code':'397903',
-            'market':'sz','enabled':True,'history_start':default_settings()['pairs'][0]['history_start']}
+        market = 'ds'
+        try:
+            next_code = available_code(self.config) if index is None else self.config['pairs'][index]['code']
+        except Exception as error:
+            self.inform(str(error));return
+        pair=copy.deepcopy(self.config['pairs'][index]) if index is not None else {'symbol':'','display_name':'','code':next_code,
+            'market':market,'enabled':True,'history_start':default_settings()['pairs'][0]['history_start']}
+        if index is None:
+            pair = adapted_pair(pair)
         dialog=tk.Toplevel(self.root);dialog.title('编辑币种' if edit else '添加币种');dialog.transient(self.root)
         variables={}
-        for row,(key,label) in enumerate([('symbol','现货交易对'),('display_name','显示名称'),('code','外部代码397xxx'),('market','市场关联（已验证sz）'),('history_start','历史起点（含UTC偏移）')]):
+        for row,(key,label) in enumerate([('symbol','现货交易对'),('display_name','显示名称（注明试验）'),('code','外部代码397xxx'),('history_start','历史起点（含UTC偏移）')]):
             ttk.Label(dialog,text=label).grid(row=row,column=0,padx=10,pady=8,sticky='w')
             variables[key]=tk.StringVar(value=pair[key]);ttk.Entry(dialog,textvariable=variables[key],width=42).grid(row=row,column=1,padx=10)
+        ttk.Label(dialog,text='新增自动采用UTC连续时段＋LC5末分钟标签；真实前补起点自动计算。\n'
+            '客户端时段及注册须校验成功才发布，不要求手填底层编码。').grid(row=4,column=0,columnspan=2,padx=10,pady=8)
         enabled=tk.BooleanVar(value=pair['enabled']);ttk.Checkbutton(dialog,text='启用同步',variable=enabled).grid(row=5,column=1,sticky='w')
         def done():
             try:
-                replacement={key:var.get().strip() for key,var in variables.items()};replacement['enabled']=enabled.get()
+                replacement=copy.deepcopy(pair)
+                replacement.update({key:var.get().strip() for key,var in variables.items()});replacement['enabled']=enabled.get()
+                replacement['symbol'] = replacement['symbol'].upper()
+                if index is None and replacement['symbol'] == 'BTCUSDT':
+                    replacement['code'] = '397901'
+                if index is None or replacement.get('lc5_time_label') == 'last_minute':
+                    replacement = adapted_pair(replacement)
+                if not replacement['display_name']:
+                    replacement['display_name'] = replacement['symbol'] + '试验'
+                if index is None and '试验' not in replacement['display_name']:
+                    replacement['display_name'] += '试验'
                 c=copy.deepcopy(self.config)
                 if index is None:c['pairs'].append(replacement)
                 else:c['pairs'][index]=replacement
@@ -263,6 +290,10 @@ class Desktop:
     def prepare_registration(self):
         try:
             pair=copy.deepcopy(self.config['pairs'][self.selected()]);c=self.gather()
+            if pair['market'] == 'ds':
+                from external_registry import register
+                self.background(lambda: register(c,[pair]))
+                return
             def prepare():
                 allowed, reason = registration_check(c, pair)
                 if not allowed and 'pending' not in reason and 'missing' not in reason:
@@ -297,6 +328,13 @@ class Desktop:
         try:self.inform(Client(self.gather()).redraw())
         except Exception as error:self.inform(str(error))
 
+    def follow_latest(self):
+        try:
+            result = self.engine.follow_latest() if self.engine and self.engine.is_alive() else Client(self.gather()).follow_latest(self.config['pairs'])
+            self.inform(result)
+        except Exception as error:
+            self.inform(str(error))
+
     def capture(self):
         try:
             c=self.gather();path=Path(c['data_directory'])/'evidence'/('chart-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'.bmp')
@@ -330,12 +368,27 @@ class Desktop:
         if self.engine:
             self.root.title('币安 → 通达信 · '+self.engine.snapshot()['connection']+'（显示试验）')
             state=self.engine.snapshot()
+            request=state.get('refresh_request',{})
+            reasons={'No unique selected-client window':'未找到唯一目标窗口',
+                'Active chart is not a configured owned instrument':'当前图表不是工具币种',
+                'Menu or GUI state unknown; no click':'菜单使用中或窗口状态不明',
+                'User editing input; no click':'正在编辑输入',
+                'User input active; defer reload':'正在操作，等待空闲',
+                'User changed chart/period; no click':'图表或周期正在切换',
+                'User changed chart; no click':'图表正在切换'}
+            reasons.update({'History navigation; automatic reload paused':'查看历史，自动重读已暂停；按End返回最新，再按Esc取消固定光标',
+                'Fixed chart cursor; automatic reload paused':'固定光标，自动重读已暂停；按End返回最新，再按Esc取消光标',
+                'Viewport not verified; return to latest to resume':'图表位置尚未确认；按End返回最新，再按Esc恢复自动重读',
+                'History protection unavailable; no click':'历史保护不可用，暂停重读'})
+            reload_text=('已请求 '+request.get('symbol','')+' '+request.get('period','') if request.get('requested')
+                else reasons.get(request.get('reason'),request.get('reason','尚未请求')))
             # Stable status panel, without exposing precision loss as hidden implementation detail.
             if not hasattr(self,'state_label'):
                 self.state_label=ttk.Label(self.root,wraplength=1000);self.state_label.pack(anchor='w',padx=12)
             self.state_label.configure(text='连接：'+state['connection']+' | 已入库：'+str(state['applied'])+
                 ' | 最后行情：'+str(state.get('last_event_ms','—'))+' | 文件更新：'+str(state.get('last_file_ms','—'))+
-                '\n补缺：'+state.get('history','—')+' | 错误：'+str(state.get('error') or state.get('file_error') or state.get('history_error') or state.get('connection_error') or '无')+
+                '\n补缺：'+state.get('history','—')+' | 错误：'+str(state.get('error') or state.get('file_error') or state.get('history_error') or state.get('connection_error') or state.get('refresh_error') or '无')+
+                '\n图表自动重读：'+reload_text+'（图表实际更新另行验证）'+
                 '\n品种：'+str({k:v for k,v in state.items() if k.startswith(('registration_', 'pair_error_'))}))
         self.root.after(500,self.poll)
 
